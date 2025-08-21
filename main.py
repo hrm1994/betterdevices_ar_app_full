@@ -411,16 +411,44 @@ def main():
                         s.angle = float(s.angle + dtheta)
                         grabbed_ref_angle = cur_ang
                 else:
-                    # move polygon by delta, then clamp per-vertex
+                    # --- POLYGON: translate to target center, then rotate by wrist twist (if any) ---
+
+                    # 1) compute translation to reach the smoothed target center
                     cx_old, cy_old = s.center()
                     dx = smoothed_cx - cx_old
                     dy = smoothed_cy - cy_old
-                    moved = []
-                    for (px, py) in s.points:
-                        nx = max(0, min(int(px + dx), frame_w - 1))
-                        ny = max(0, min(int(py + dy), frame_h - 1))
-                        moved.append((nx, ny))
-                    s.points = moved
+
+                    # translate points first
+                    moved = [(px + dx, py + dy) for (px, py) in s.points]
+
+                    # 2) apply incremental rotation around the *new* center using wrist twist
+                    if grabbed_ref_angle is not None:
+                        vx = hand.index_mcp[0] - hand.wrist[0]
+                        vy = hand.index_mcp[1] - hand.wrist[1]
+                        cur_ang_deg = np.degrees(np.arctan2(vy, vx))
+                        dtheta_rad = np.radians(cur_ang_deg - grabbed_ref_angle)
+
+                        if abs(dtheta_rad) > 1e-6:
+                            cos_t = np.cos(dtheta_rad)
+                            sin_t = np.sin(dtheta_rad)
+                            # rotate around smoothed center (smoothed_cx, smoothed_cy)
+                            roted = []
+                            for (px, py) in moved:
+                                rx = smoothed_cx + cos_t * (px - smoothed_cx) - sin_t * (py - smoothed_cy)
+                                ry = smoothed_cy + sin_t * (px - smoothed_cx) + cos_t * (py - smoothed_cy)
+                                # clamp after rotation
+                                rx = max(0, min(int(rx), frame_w - 1))
+                                ry = max(0, min(int(ry), frame_h - 1))
+                                roted.append((rx, ry))
+                            moved = roted
+
+                        # update reference for incremental rotation
+                        grabbed_ref_angle = cur_ang_deg
+
+                    # 3) write back points if we didn’t rotate (or after rotation)
+                    if 'moved' in locals():
+                        s.points = [(int(px), int(py)) for (px, py) in moved]
+
         else:
             # Not interacting: ensure no stale selection/grab carries into EDIT
             selected_idx = -1
