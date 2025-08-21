@@ -140,6 +140,12 @@ def main():
 
     grab_start_tip = None      # (x,y) fingertip position when grab begins
     grab_start_center = None   # (cx,cy) shape center when grab begins
+    move_gain=1.5 # how much to move the shape when dragging (1.0 = 1:1, 2.0 = double, etc.)
+
+    rotation_gain = 0.7          # < 1.0 = less sensitive (try 0.2–0.5)
+    rotation_deadzone_deg = 5.0   # ignore wrist jitters smaller than this (degrees)
+    rotation_alpha = 0.0          # 0 = no smoothing; 0.1–0.3 = smoother but laggier
+
 
 
     # Pointing ray smoothing
@@ -374,15 +380,16 @@ def main():
                 s = shapes[last_selected_idx]
 
                 # Move by the delta of fingertip since grab started (no snap)
+                # Move by the delta of fingertip since grab started (scaled by move_gain)
                 tipx, tipy = hand.index_tip
                 if (grab_start_tip is not None) and (grab_start_center is not None):
-                    dx = float(tipx - grab_start_tip[0])
-                    dy = float(tipy - grab_start_tip[1])
-                    target_cx = float(grab_start_center[0] + dx)
-                    target_cy = float(grab_start_center[1] + dy)
+                    dx = (float(tipx) - float(grab_start_tip[0])) * move_gain
+                    dy = (float(tipy) - float(grab_start_tip[1])) * move_gain
+                    target_cx = float(grab_start_center[0]) + dx
+                    target_cy = float(grab_start_center[1]) + dy
                 else:
-                    # fallback (shouldn't happen), keep current center
                     target_cx, target_cy = s.center()
+
 
 
                 # 4.2 keep inside frame
@@ -402,14 +409,24 @@ def main():
                 # 4.4 apply movement
                 if isinstance(s, Rectangle):
                     s.move_to(s.smoothed_center)
-                    # rotation while grabbed (optional bonus)
+                    
+                    # rotation while grabbed (with gain + deadzone + optional smoothing)
                     if grabbed_ref_angle is not None:
                         vx = hand.index_mcp[0] - hand.wrist[0]
                         vy = hand.index_mcp[1] - hand.wrist[1]
                         cur_ang = np.degrees(np.arctan2(vy, vx))
-                        dtheta = cur_ang - grabbed_ref_angle
-                        s.angle = float(s.angle + dtheta)
-                        grabbed_ref_angle = cur_ang
+
+                        raw_delta = cur_ang - grabbed_ref_angle
+                        if abs(raw_delta) > rotation_deadzone_deg:
+                            dtheta = raw_delta * rotation_gain
+                            s.angle = float(s.angle + dtheta)
+
+                            # update reference (optionally smoothed)
+                            if rotation_alpha > 0.0:
+                                grabbed_ref_angle = (1.0 - rotation_alpha) * grabbed_ref_angle + rotation_alpha * cur_ang
+                            else:
+                                grabbed_ref_angle = cur_ang
+
                 else:
                     # --- POLYGON: translate to target center, then rotate by wrist twist (if any) ---
 
@@ -421,29 +438,36 @@ def main():
                     # translate points first
                     moved = [(px + dx, py + dy) for (px, py) in s.points]
 
+
                     # 2) apply incremental rotation around the *new* center using wrist twist
                     if grabbed_ref_angle is not None:
                         vx = hand.index_mcp[0] - hand.wrist[0]
                         vy = hand.index_mcp[1] - hand.wrist[1]
                         cur_ang_deg = np.degrees(np.arctan2(vy, vx))
-                        dtheta_rad = np.radians(cur_ang_deg - grabbed_ref_angle)
 
-                        if abs(dtheta_rad) > 1e-6:
-                            cos_t = np.cos(dtheta_rad)
-                            sin_t = np.sin(dtheta_rad)
-                            # rotate around smoothed center (smoothed_cx, smoothed_cy)
-                            roted = []
-                            for (px, py) in moved:
-                                rx = smoothed_cx + cos_t * (px - smoothed_cx) - sin_t * (py - smoothed_cy)
-                                ry = smoothed_cy + sin_t * (px - smoothed_cx) + cos_t * (py - smoothed_cy)
-                                # clamp after rotation
-                                rx = max(0, min(int(rx), frame_w - 1))
-                                ry = max(0, min(int(ry), frame_h - 1))
-                                roted.append((rx, ry))
-                            moved = roted
+                        raw_delta_deg = cur_ang_deg - grabbed_ref_angle
+                        if abs(raw_delta_deg) > rotation_deadzone_deg:
+                            dtheta_rad = np.radians(raw_delta_deg * rotation_gain)
+                            if abs(dtheta_rad) > 1e-6:
+                                cos_t = np.cos(dtheta_rad)
+                                sin_t = np.sin(dtheta_rad)
+                                # rotate around smoothed center (smoothed_cx, smoothed_cy)
+                                roted = []
+                                for (px, py) in moved:
+                                    rx = smoothed_cx + cos_t * (px - smoothed_cx) - sin_t * (py - smoothed_cy)
+                                    ry = smoothed_cy + sin_t * (px - smoothed_cx) + cos_t * (py - smoothed_cy)
+                                    # clamp after rotation
+                                    rx = max(0, min(int(rx), frame_w - 1))
+                                    ry = max(0, min(int(ry), frame_h - 1))
+                                    roted.append((rx, ry))
+                                moved = roted
 
-                        # update reference for incremental rotation
-                        grabbed_ref_angle = cur_ang_deg
+                            # update reference (optionally smoothed)
+                            if rotation_alpha > 0.0:
+                                grabbed_ref_angle = (1.0 - rotation_alpha) * grabbed_ref_angle + rotation_alpha * cur_ang_deg
+                            else:
+                                grabbed_ref_angle = cur_ang_deg
+
 
                     # 3) write back points if we didn’t rotate (or after rotation)
                     if 'moved' in locals():
