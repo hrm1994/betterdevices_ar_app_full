@@ -132,10 +132,15 @@ def main():
     drag_has_moved = False         # to avoid odd first-frame artifacts
     selected_idx = -1
     grabbed = False
+    grabbed_idx = -1 
     grab_offset = (0, 0)
     grabbed_ref_angle = None
     persistence_enabled = False  # <- keep OFF to stop any auto-move; toggle with 'O'
     Last_selected_idx = -1
+
+    grab_start_tip = None      # (x,y) fingertip position when grab begins
+    grab_start_center = None   # (cx,cy) shape center when grab begins
+
 
     # Pointing ray smoothing
     ray_o = None
@@ -346,29 +351,39 @@ def main():
             if (selected_idx != -1) and pinch_now and not grabbed:
                 grabbed = True
                 last_selected_idx = selected_idx  # <— latch the target
-                center = shapes[selected_idx].center()
-                grab_offset = (
-                    center[0] - (ray_o[0] + best_t * ray_d[0]),
-                    center[1] - (ray_o[1] + best_t * ray_d[1])
-                )
-                # rotation reference (wrist -> index_mcp)
+
+                # record starting positions (no snapping)
+                grab_start_tip = tuple(hand.index_tip)           # (x,y) at grab start
+                grab_start_center = shapes[selected_idx].center()# (cx,cy) at grab start
+
+                # rotation reference (optional)
                 v0x = hand.index_mcp[0] - hand.wrist[0]
                 v0y = hand.index_mcp[1] - hand.wrist[1]
                 grabbed_ref_angle = np.degrees(np.arctan2(v0y, v0x))
 
+
             # --- 3) Release pinch ---
             elif grabbed and not pinch_now:
                 grabbed = False
+                grab_start_tip = None
+                grab_start_center = None
                 cooldown = max(cooldown, 10)  # short cooldown after release
 
             # --- 4) While grabbed: move selected object ---
-            if grabbed and last_selected_idx != -1:
-                s = shapes[selected_idx]
+            if grabbed and last_selected_idx != -1 and selected_idx == last_selected_idx:
+                s = shapes[last_selected_idx]
 
-                # 4.1 target center = fingertip + offset captured at grab
-                target_cx, target_cy = hand.index_tip
-                target_cx += grab_offset[0]
-                target_cy += grab_offset[1]
+                # Move by the delta of fingertip since grab started (no snap)
+                tipx, tipy = hand.index_tip
+                if (grab_start_tip is not None) and (grab_start_center is not None):
+                    dx = float(tipx - grab_start_tip[0])
+                    dy = float(tipy - grab_start_tip[1])
+                    target_cx = float(grab_start_center[0] + dx)
+                    target_cy = float(grab_start_center[1] + dy)
+                else:
+                    # fallback (shouldn't happen), keep current center
+                    target_cx, target_cy = s.center()
+
 
                 # 4.2 keep inside frame
                 if isinstance(s, Rectangle):
@@ -453,11 +468,12 @@ def main():
                 pts_np = np.array(poly_pts, dtype=np.int32)
                 cv2.polylines(frame, [pts_np], False, (255, 200, 0), 2)
                 if curr_mouse is not None:
-                    last = poly_pts[-1]
+                    last_pt = poly_pts[-1]   # <- renamed; no longer clobbers FPS 'last'
                     cv2.line(frame,
-                            (int(last[0]), int(last[1])),
+                            (int(last_pt[0]), int(last_pt[1])),
                             (int(curr_mouse[0]), int(curr_mouse[1])),
                             (0, 255, 0), 2)
+
 
 
         # HUD text
