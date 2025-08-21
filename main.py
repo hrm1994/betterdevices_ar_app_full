@@ -7,6 +7,40 @@ from hands import HandTracker
 from persistence import BackgroundTracker
 
 
+
+
+def _angle_ok(ray_d, pt_from_o, cos_min=0.995):  # ≈ 5.7° cone
+    v = np.array(pt_from_o, dtype=np.float32)
+    vn = np.linalg.norm(v) + 1e-6
+    v = v / vn
+    d = np.array(ray_d, dtype=np.float32)
+    dn = np.linalg.norm(d) + 1e-6
+    d = d / dn
+    return float(d @ v) > cos_min
+
+def _is_valid_H(H, frame_w, frame_h):
+    if H is None or not isinstance(H, np.ndarray) or H.shape != (3, 3):
+        return False
+    if not np.all(np.isfinite(H)):
+        return False
+    # Expect affine-like homography with bottom row [0,0,1]
+    if np.linalg.norm(H[2, :] - np.array([0.0, 0.0, 1.0], dtype=np.float32)) > 1e-3:
+        return False
+    if abs(float(H[2, 2])) < 1e-6:
+        return False
+    # Translation should be reasonable (guard wild estimates)
+    tx, ty = float(H[0, 2]), float(H[1, 2])
+    if abs(tx) > 0.25 * frame_w or abs(ty) > 0.25 * frame_h:
+        return False
+    # Scale/rotation not absurd (avoid near-zero scale / reflection explosions)
+    a, b, c, d = float(H[0,0]), float(H[0,1]), float(H[1,0]), float(H[1,1])
+    det = a*d - b*c
+    if abs(det) < 1e-6 or abs(det) > 10.0:
+        return False
+    return True
+
+
+
 # ---------- Helpers ----------
 def clamp_rect(x, y, w, h, frame_w, frame_h):
     """Clamp a rectangle's top-left so it stays fully inside the frame."""
@@ -65,12 +99,25 @@ def save_shapes(shapes, path="shapes.json"):
 
 # ---------- Main ----------
 def main():
+
+    cooldown = 0  # frames to skip bg tracking after release or shape creation
+
     args = parse_args()
+    import time
+    spf = 1.0 / max(1, args.max_fps)
+    last = 0.0
+
     cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
-    tracker = HandTracker()
+    tracker = HandTracker(
+    pinch_on_scale=0.30,     # pinch engages around 0.30 * hand_size
+    pinch_off_scale=0.40,    # releases around 0.40 * hand_size
+    angle_threshold_deg=160  # index should be fairly straight while pointing
+)
+
+
     bg_tracker = BackgroundTracker()
 
     mode = "EDIT"  # or "INTERACT"
@@ -86,6 +133,9 @@ def main():
     selected_idx = -1
     grabbed = False
     grab_offset = (0, 0)
+    grabbed_ref_angle = None
+    persistence_enabled = False  # <- keep OFF to stop any auto-move; toggle with 'O'
+    Last_selected_idx = -1
 
     # Pointing ray smoothing
     ray_o = None
@@ -96,7 +146,8 @@ def main():
     cv2.namedWindow("2D AR App", cv2.WINDOW_NORMAL)
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal drawing, start_pt, curr_mouse, drag_has_moved, shapes, polygon_mode, poly_pts
+        nonlocal drawing, start_pt, curr_mouse, drag_has_moved, shapes, polygon_mode, poly_pts, cooldown
+
         curr_mouse = (x, y)
 
         if mode != "EDIT":
@@ -135,6 +186,8 @@ def main():
 
                 if w0c > 5 and h0c > 5:
                     shapes.append(Rectangle(x0c, y0c, w0c, h0c))
+                    cooldown = 10
+                    
             start_pt = None
 
     # we pass a dict param so callback can read frame size for clamping polygon points
@@ -152,9 +205,22 @@ def main():
         frame_h, frame_w = frame.shape[:2]
         mouse_param["frame_shape"] = (frame_h, frame_w)
 
-        # Background optical-feature transform (for persistence demo)
+
+        # Background optical-feature transform (for persistence)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        H = bg_tracker.estimate_transform(gray)
+
+        if mode == "INTERACT" and not grabbed and cooldown == 0 and persistence_enabled:
+            H_cand = bg_tracker.estimate_transform(gray)  # 3x3
+            H = H_cand if _is_valid_H(H_cand, frame_w, frame_h) else np.eye(3, dtype=np.float32)
+        else:
+            H = np.eye(3, dtype=np.float32)
+
+
+
+        # tick cooldown (if active)
+        if cooldown > 0:
+            cooldown -= 1
+
 
         # Hand tracking
         hand = tracker.process(frame)
@@ -171,30 +237,90 @@ def main():
                 ray_o = alpha * o + (1 - alpha) * ray_o
                 ray_d = alpha * d + (1 - alpha) * ray_d
 
-        # Apply persistence (when not holding anything): move shapes a bit with H, then clamp
-        if not grabbed:
-            for s in shapes:
-                if isinstance(s, Rectangle):
-                    cx, cy = s.center()
-                    pt = np.array([cx, cy, 1], dtype=np.float32)
-                    new = H @ pt
-                    s.move_to((float(new[0]), float(new[1])))
-                elif isinstance(s, Polygon):
-                    new_points = []
-                    for (px, py) in s.points:
-                        pt = np.array([px, py, 1], dtype=np.float32)
-                        new = H @ pt
-                        new_points.append((float(new[0]), float(new[1])))
-                    s.points = new_points
+        # ---- Pinch detection (robust) ----
+        pinch_now = False
+        pinch_dist_px = None
+        if hand:
+            idx = np.array(hand.index_tip, dtype=np.float32)
+            thb = np.array(hand.thumb_tip, dtype=np.float32)
+            pinch_dist_px = float(np.linalg.norm(idx - thb))
+            pinch_now = bool(getattr(hand, "pinch", False))
+            # Fallback if model’s pinch flag is too strict on this camera
+            if not pinch_now:
+                PINCH_PX_THRESHOLD = 50.0  # adjust 40–60 if needed
+                pinch_now = pinch_dist_px < PINCH_PX_THRESHOLD
+        else:
+            pinch_now = False
 
-            # Clamp shapes inside window after persistence motion
+
+        # Apply persistence (when not holding anything): move shapes a bit with H, then clamp
+        # only apply background tracking if no shape is being grabbed
+        # Apply persistence (background motion) only when appropriate
+        if mode == "INTERACT" and not grabbed and cooldown == 0 and persistence_enabled:
+
+            I = np.eye(3, dtype=np.float32)
+            if not np.allclose(H, I, atol=1e-6):
+                for s in shapes:
+                    if isinstance(s, Rectangle):
+                        cx, cy = s.center()
+                        pt = np.array([cx, cy, 1.0], dtype=np.float32)
+                        new = H @ pt
+                        w = float(new[2]) if new.shape[0] == 3 else 1.0
+                        if abs(w) < 1e-6:
+                            continue  # skip bad transform
+                        nx, ny = float(new[0] / w), float(new[1] / w)
+
+                        # smooth & clamp to keep inside frame
+                        if not hasattr(s, "smoothed_center"):
+                            s.smoothed_center = (cx, cy)
+                        alpha_move = 0.15
+                        smx = int((1 - alpha_move) * s.smoothed_center[0] + alpha_move * nx)
+                        smy = int((1 - alpha_move) * s.smoothed_center[1] + alpha_move * ny)
+
+                        # clamp fully inside
+                        smx, smy = clamp_center_for_rect(smx, smy, s.w, s.h, frame_w, frame_h)
+                        s.smoothed_center = (smx, smy)
+                        s.move_to(s.smoothed_center)
+
+                    elif isinstance(s, Polygon):
+                        new_points = []
+                        for (x, y) in s.points:
+                            pt = np.array([x, y, 1.0], dtype=np.float32)
+                            new = H @ pt
+                            w = float(new[2]) if new.shape[0] == 3 else 1.0
+                            if abs(w) < 1e-6:
+                                new_points.append((x, y))  # keep original point on bad H
+                                continue
+                            nx, ny = float(new[0] / w), float(new[1] / w)
+                            # clamp point-by-point
+                            nx = max(0, min(int(nx), frame_w - 1))
+                            ny = max(0, min(int(ny), frame_h - 1))
+                            new_points.append((nx, ny))
+                        s.points = new_points
+
+
+
+                    # Clamp shapes inside window after persistence motion
             for s in shapes:
                 if isinstance(s, Rectangle):
                     cx, cy = s.center()
                     x_rect = cx - s.w / 2
                     y_rect = cy - s.h / 2
-                    x_rect, y_rect, _, _ = clamp_rect(x_rect, y_rect, s.w, s.h, frame_w, frame_h)
-                    s.move_to((x_rect + s.w / 2, y_rect + s.h / 2))
+                    x_rect, y_rect, w_rect, h_rect = clamp_rect(x_rect, y_rect, s.w, s.h, frame_w, frame_h)
+                    # store last smoothed center in the shape
+                    # compute clamped center
+                    clamped_cx = int(x_rect + w_rect / 2)
+                    clamped_cy = int(y_rect + h_rect / 2)
+                    if not hasattr(s, "smoothed_center"):
+                        s.smoothed_center = (clamped_cx, clamped_cy)
+
+                    alpha_move = 0.15  # smaller = smoother, larger = snappier
+                    smoothed_cx = int(alpha_move * clamped_cx + (1 - alpha_move) * s.smoothed_center[0])
+                    smoothed_cy = int(alpha_move * clamped_cy + (1 - alpha_move) * s.smoothed_center[1])
+
+                    s.smoothed_center = (smoothed_cx, smoothed_cy)
+                    s.move_to(s.smoothed_center)
+
                 elif isinstance(s, Polygon):
                     clamped = []
                     for (px, py) in s.points:
@@ -202,53 +328,96 @@ def main():
                                         max(0, min(int(py), frame_h - 1))))
                     s.points = clamped
 
-        # Selection + grabbing in INTERACT mode
+        # Selection + grabbing (INTERACT only)
         selected_idx = -1
         best_t = 1e9
-        if mode == "INTERACT" and hand and ray_o is not None:
-            # ray-select closest shape
+
+        if mode == "INTERACT" and (hand is not None) and (ray_o is not None) and (ray_d is not None):
+            # --- 1) Ray-cast selection with angle cone filter ---
             for i, s in enumerate(shapes):
                 hit = s.intersects_ray(tuple(ray_o), tuple(ray_d))
-                if hit is not None and hit[0] < best_t:
-                    best_t = hit[0]
-                    selected_idx = i
+                if hit is not None:
+                    t, p = hit
+                    if t >= 0 and _angle_ok(ray_d, (p[0]-ray_o[0], p[1]-ray_o[1])) and t < best_t:
+                        best_t = t
+                        selected_idx = i
 
-            # Grab / release
-            if selected_idx != -1 and hand.pinch and not grabbed:
+            # --- 2) Pinch to grab (only if a target is selected) ---
+            if (selected_idx != -1) and pinch_now and not grabbed:
                 grabbed = True
+                last_selected_idx = selected_idx  # <— latch the target
                 center = shapes[selected_idx].center()
-                # offset between hit point & center – approximate with current best_t
-                grab_offset = (center[0] - (ray_o[0] + best_t * ray_d[0]),
-                               center[1] - (ray_o[1] + best_t * ray_d[1]))
-            elif grabbed and not hand.pinch:
+                grab_offset = (
+                    center[0] - (ray_o[0] + best_t * ray_d[0]),
+                    center[1] - (ray_o[1] + best_t * ray_d[1])
+                )
+                # rotation reference (wrist -> index_mcp)
+                v0x = hand.index_mcp[0] - hand.wrist[0]
+                v0y = hand.index_mcp[1] - hand.wrist[1]
+                grabbed_ref_angle = np.degrees(np.arctan2(v0y, v0x))
+
+            # --- 3) Release pinch ---
+            elif grabbed and not pinch_now:
                 grabbed = False
+                cooldown = max(cooldown, 10)  # short cooldown after release
 
-            # While grabbed: move, but keep inside frame
-            if grabbed and selected_idx != -1:
-                t = best_t if best_t < 1e8 else 50.0
-                intended_cx = ray_o[0] + t * ray_d[0] + grab_offset[0]
-                intended_cy = ray_o[1] + t * ray_d[1] + grab_offset[1]
-
+            # --- 4) While grabbed: move selected object ---
+            if grabbed and last_selected_idx != -1:
                 s = shapes[selected_idx]
+
+                # 4.1 target center = fingertip + offset captured at grab
+                target_cx, target_cy = hand.index_tip
+                target_cx += grab_offset[0]
+                target_cy += grab_offset[1]
+
+                # 4.2 keep inside frame
                 if isinstance(s, Rectangle):
-                    clamped_cx, clamped_cy = clamp_center_for_rect(intended_cx, intended_cy, s.w, s.h, frame_w, frame_h)
-                    s.move_to((clamped_cx, clamped_cy))
-                elif isinstance(s, Polygon):
-                    # Move by delta, then clamp each vertex
+                    target_cx, target_cy = clamp_center_for_rect(
+                        target_cx, target_cy, s.w, s.h, frame_w, frame_h
+                    )
+
+                # 4.3 smooth
+                alpha_move = 0.25
+                if not hasattr(s, "smoothed_center"):
+                    s.smoothed_center = s.center()
+                smoothed_cx = int((1 - alpha_move) * s.smoothed_center[0] + alpha_move * target_cx)
+                smoothed_cy = int((1 - alpha_move) * s.smoothed_center[1] + alpha_move * target_cy)
+                s.smoothed_center = (smoothed_cx, smoothed_cy)
+
+                # 4.4 apply movement
+                if isinstance(s, Rectangle):
+                    s.move_to(s.smoothed_center)
+                    # rotation while grabbed (optional bonus)
+                    if grabbed_ref_angle is not None:
+                        vx = hand.index_mcp[0] - hand.wrist[0]
+                        vy = hand.index_mcp[1] - hand.wrist[1]
+                        cur_ang = np.degrees(np.arctan2(vy, vx))
+                        dtheta = cur_ang - grabbed_ref_angle
+                        s.angle = float(s.angle + dtheta)
+                        grabbed_ref_angle = cur_ang
+                else:
+                    # move polygon by delta, then clamp per-vertex
                     cx_old, cy_old = s.center()
-                    dx = intended_cx - cx_old
-                    dy = intended_cy - cy_old
+                    dx = smoothed_cx - cx_old
+                    dy = smoothed_cy - cy_old
                     moved = []
                     for (px, py) in s.points:
                         nx = max(0, min(int(px + dx), frame_w - 1))
                         ny = max(0, min(int(py + dy), frame_h - 1))
                         moved.append((nx, ny))
                     s.points = moved
+        else:
+            # Not interacting: ensure no stale selection/grab carries into EDIT
+            selected_idx = -1
+            if mode != "INTERACT":
+                grabbed = False
+
 
         # Draw shapes
         for i, s in enumerate(shapes):
-            s.draw(frame, selected=(i == selected_idx))
+            s.draw(frame, selected=(mode == "INTERACT" and i == selected_idx))
 
+        # --- EDIT MODE PREVIEW (draw BEFORE text/imshow) ---
         # --- EDIT MODE PREVIEW (draw BEFORE text/imshow) ---
         if mode == "EDIT":
             if drawing and start_pt is not None and curr_mouse is not None and drag_has_moved:
@@ -257,15 +426,25 @@ def main():
                 # raw rectangle
                 x0, y0 = min(x1, mx), min(y1, my)
                 w0, h0 = abs(mx - x1), abs(my - y1)
-                # clamp preview
-                x0c, y0c, w0c, h0c = clamp_rect(x0, y0, w0, h0, frame_w, frame_h)
 
-                # outline
-                cv2.rectangle(frame, (x0c, y0c), (x0c + w0c, y0c + h0c), (0, 255, 255), 2)
-                # fill
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (x0c, y0c), (x0c + w0c, y0c + h0c), (0, 255, 255), -1)
-                frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
+                # clamp preview
+                rect = clamp_rect(x0, y0, w0, h0, frame_w, frame_h)
+                if rect is not None:
+                    x0c, y0c, w0c, h0c = rect
+
+                    # outline
+                    cv2.rectangle(frame,
+                                (int(x0c), int(y0c)),
+                                (int(x0c + w0c), int(y0c + h0c)),
+                                (0, 255, 255), 2)
+
+                    # fill
+                    overlay = frame.copy()
+                    cv2.rectangle(overlay,
+                                (int(x0c), int(y0c)),
+                                (int(x0c + w0c), int(y0c + h0c)),
+                                (0, 255, 255), -1)
+                    frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
 
             # polygon live preview (existing vertices + live edge)
             if polygon_mode and len(poly_pts) >= 1:
@@ -275,19 +454,47 @@ def main():
                 cv2.polylines(frame, [pts_np], False, (255, 200, 0), 2)
                 if curr_mouse is not None:
                     last = poly_pts[-1]
-                    cv2.line(frame, (int(last[0]), int(last[1])),
-                             (int(curr_mouse[0]), int(curr_mouse[1])), (0, 255, 0), 2)
+                    cv2.line(frame,
+                            (int(last[0]), int(last[1])),
+                            (int(curr_mouse[0]), int(curr_mouse[1])),
+                            (0, 255, 0), 2)
+
 
         # HUD text
         draw_text(frame, f"Mode: {mode}", y=30)
+        # Status HUD
+        y = 60
+        hand_ok = hand is not None
+        sel_txt = "None" if selected_idx == -1 else str(selected_idx)
+        grab_txt = "YES" if grabbed else "NO"
+        pinch_txt = "YES" if pinch_now else "NO"
+        draw_text(frame, f"Hand:{'YES' if hand_ok else 'NO'}  Pinch:{pinch_txt}  Selected:{sel_txt}  Grabbed:{grab_txt}", y)
+        if pinch_dist_px is not None:
+            draw_text(frame, f"PinchDist(px): {pinch_dist_px:.1f}", y+30)
+
+        # show thumb-index distance and index angle
         if hand:
-            draw_text(frame, f"Pinch: {hand.pinch}", y=60)
+            p1, p2 = tuple(map(int, hand.index_tip)), tuple(map(int, hand.thumb_tip))
+            cv2.line(frame, p1, p2, (0,255,0) if hand.pinch else (0,0,255), 2)
+            # draw index vector
+            imcp = tuple(map(int, hand.index_mcp))
+            itip = tuple(map(int, hand.index_tip))
+            cv2.line(frame, imcp, itip, (255,0,0), 2)
+            # (print text values if you expose angle/thresholds from HandTracker)
+
 
         # (Optional) visualize pointing ray for debugging
         if ray_o is not None and ray_d is not None:
             p1 = tuple(map(int, ray_o))
             p2 = (int(ray_o[0] + 200 * ray_d[0]), int(ray_o[1] + 200 * ray_d[1]))
             cv2.line(frame, p1, p2, (0, 0, 255), 2)
+
+        now = time.perf_counter()
+        sleep = spf - (now - last)
+        if sleep > 0:
+            time.sleep(sleep)
+        last = time.perf_counter()
+
 
         # Show
         cv2.imshow("2D AR App", frame)
@@ -300,6 +507,7 @@ def main():
             mode = "EDIT"
         elif key in [ord('i'), ord('I')]:
             mode = "INTERACT"
+            cooldown = 15
         elif key in [ord('s'), ord('S')]:
             save_shapes(shapes)
         elif key in [ord('l'), ord('L')]:
