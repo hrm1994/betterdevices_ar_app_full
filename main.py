@@ -58,6 +58,40 @@ def clamp_center_for_rect(cx, cy, w_rect, h_rect, frame_w, frame_h):
     cy = min(max(int(cy), half_h), frame_h - half_h)
     return int(cx), int(cy)
 
+def clamp_polygon_rigid(points, frame_w, frame_h):
+    """
+    If any vertex is out of bounds, compute a single (dx, dy) that translates
+    the entire polygon back inside the frame without distorting it.
+    Returns a list of (int,int) points.
+    """
+    if not points:
+        return points
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    dx = 0.0
+    dy = 0.0
+
+    if min_x < 0:
+        dx = -min_x
+    elif max_x > frame_w - 1:
+        dx = (frame_w - 1) - max_x
+
+    if min_y < 0:
+        dy = -min_y
+    elif max_y > frame_h - 1:
+        dy = (frame_h - 1) - max_y
+
+    if dx != 0.0 or dy != 0.0:
+        return [(int(px + dx), int(py + dy)) for (px, py) in points]
+    else:
+        # already inside; just cast to int once to avoid cumulative rounding
+        return [(int(px), int(py)) for (px, py) in points]
+
+
 
 # ---------- Argparse / Utils ----------
 def parse_args():
@@ -141,6 +175,19 @@ def main():
     grab_start_tip = None      # (x,y) fingertip position when grab begins
     grab_start_center = None   # (cx,cy) shape center when grab begins
     move_gain=1.5 # how much to move the shape when dragging (1.0 = 1:1, 2.0 = double, etc.)
+
+    # Selection & pinch edge / relatch state
+    pinch_prev = False
+    prev_selected_idx = -1
+    select_stable = 0
+    RELATCH_STABLE_FRAMES = 2   # how many frames selection must stay on new shape to relatch mid-pinch
+
+
+    ASSIST_FRACTION = 0.40   # 10% of shape size acts as near-miss halo
+    ASSIST_MIN_PX   = 20.0   # never smaller than 20 px
+    ASSIST_MAX_PX   = 80.0   # never larger than 80 px
+    ASSIST_FAVOR_HIT = 0.5   # bias score to prefer true ray hits (lower is stronger bias)
+
 
     rotation_gain = 0.7          # < 1.0 = less sensitive (try 0.2–0.5)
     rotation_deadzone_deg = 5.0   # ignore wrist jitters smaller than this (degrees)
@@ -294,20 +341,19 @@ def main():
                         s.move_to(s.smoothed_center)
 
                     elif isinstance(s, Polygon):
-                        new_points = []
+                        moved = []
                         for (x, y) in s.points:
                             pt = np.array([x, y, 1.0], dtype=np.float32)
                             new = H @ pt
                             w = float(new[2]) if new.shape[0] == 3 else 1.0
                             if abs(w) < 1e-6:
-                                new_points.append((x, y))  # keep original point on bad H
+                                moved.append((float(x), float(y)))  # keep original point on bad H
                                 continue
                             nx, ny = float(new[0] / w), float(new[1] / w)
-                            # clamp point-by-point
-                            nx = max(0, min(int(nx), frame_w - 1))
-                            ny = max(0, min(int(ny), frame_h - 1))
-                            new_points.append((nx, ny))
-                        s.points = new_points
+                            moved.append((nx, ny))
+                        # rigid clamp instead of per-vertex clipping
+                        s.points = clamp_polygon_rigid(moved, frame_w, frame_h)
+
 
 
 
@@ -344,7 +390,11 @@ def main():
         best_t = 1e9
 
         if mode == "INTERACT" and (hand is not None) and (ray_o is not None) and (ray_d is not None):
-            # --- 1) Ray-cast selection with angle cone filter ---
+
+            # --- 1) Primary: ray-cast selection (best_t = closest along ray) ---
+            selected_idx = -1
+            best_t = 1e9
+
             for i, s in enumerate(shapes):
                 hit = s.intersects_ray(tuple(ray_o), tuple(ray_d))
                 if hit is not None:
@@ -353,14 +403,81 @@ def main():
                         best_t = t
                         selected_idx = i
 
+            # --- 1b) Aim-assist near-miss if ray-cast missed ---
+            if selected_idx == -1:
+                o = np.array(ray_o, dtype=np.float32)
+                d = np.array(ray_d, dtype=np.float32)
+                d /= (np.linalg.norm(d) + 1e-6)
+
+                best_score = 1e9
+                assist_idx = -1
+
+                for i, s in enumerate(shapes):
+                    # center & characteristic size (diagonal)
+                    cx, cy = s.center()
+                    if isinstance(s, Rectangle):
+                        diag = float(np.hypot(s.w, s.h))
+                    else:  # Polygon
+                        pts = np.array(s.points, dtype=np.float32)
+                        xs = pts[:,0]; ys = pts[:,1]
+                        w = float(xs.max() - xs.min() + 1e-6)
+                        h = float(ys.max() - ys.min() + 1e-6)
+                        diag = float(np.hypot(w, h))
+
+                    halo = np.clip(ASSIST_FRACTION * diag, ASSIST_MIN_PX, ASSIST_MAX_PX)
+
+                    # distance from shape center to ray (perpendicular)
+                    c = np.array([cx, cy], dtype=np.float32)
+                    v = c - o
+                    t_along = float(d @ v)
+                    if t_along <= 0:
+                        continue  # only shapes in front of the finger
+
+                    perp = float(np.linalg.norm(v - t_along * d))  # pixels
+
+                    if perp <= halo:
+                        # normalized distance inside halo (0 at centerline, 1 at halo edge)
+                        norm = perp / max(halo, 1e-6)
+
+                        # tie-breaker: also consider how far along the ray it is (closer in front is better)
+                        along_norm = t_along / (diag + 1e-6)  # scale by size to avoid bias
+                        score = norm + 0.25 * along_norm  # small weight on along distance
+
+                        if score < best_score:
+                            best_score = score
+                            assist_idx = i
+
+                if assist_idx != -1:
+                    selected_idx = assist_idx
+                    best_t = 0.0  # we didn't compute a real hit distance; not needed for our use
+
+                # Track how stable the current selection is across frames
+                if selected_idx == prev_selected_idx and selected_idx != -1:
+                    select_stable += 1
+                else:
+                    select_stable = 0
+
+
+
             # --- 2) Pinch to grab (only if a target is selected) ---
-            if (selected_idx != -1) and pinch_now and not grabbed:
+            start_new_grab = False
+
+            # (A) normal start: pinch rising edge on a valid selection
+            if pinch_now and not pinch_prev and selected_idx != -1:
+                start_new_grab = True
+
+            # (B) mid-pinch relatch: still pinching, selection changed and is stable briefly
+            elif pinch_now and grabbed and selected_idx != -1 and selected_idx != last_selected_idx and select_stable >= RELATCH_STABLE_FRAMES:
+                grabbed = False            # end previous grab
+                start_new_grab = True      # start a new one on the new selection
+
+            if start_new_grab:
                 grabbed = True
-                last_selected_idx = selected_idx  # <— latch the target
+                last_selected_idx = selected_idx  # latch target
 
                 # record starting positions (no snapping)
-                grab_start_tip = tuple(hand.index_tip)           # (x,y) at grab start
-                grab_start_center = shapes[selected_idx].center()# (cx,cy) at grab start
+                grab_start_tip = tuple(hand.index_tip)                 # (x,y) at grab start
+                grab_start_center = shapes[selected_idx].center()      # (cx,cy) at grab start
 
                 # rotation reference (optional)
                 v0x = hand.index_mcp[0] - hand.wrist[0]
@@ -428,6 +545,7 @@ def main():
                                 grabbed_ref_angle = cur_ang
 
                 else:
+
                     # --- POLYGON: translate to target center, then rotate by wrist twist (if any) ---
 
                     # 1) compute translation to reach the smoothed target center
@@ -435,9 +553,8 @@ def main():
                     dx = smoothed_cx - cx_old
                     dy = smoothed_cy - cy_old
 
-                    # translate points first
-                    moved = [(px + dx, py + dy) for (px, py) in s.points]
-
+                    # translate points first (keep as float while transforming)
+                    moved = [(float(px) + dx, float(py) + dy) for (px, py) in s.points]
 
                     # 2) apply incremental rotation around the *new* center using wrist twist
                     if grabbed_ref_angle is not None:
@@ -452,15 +569,11 @@ def main():
                                 cos_t = np.cos(dtheta_rad)
                                 sin_t = np.sin(dtheta_rad)
                                 # rotate around smoothed center (smoothed_cx, smoothed_cy)
-                                roted = []
-                                for (px, py) in moved:
-                                    rx = smoothed_cx + cos_t * (px - smoothed_cx) - sin_t * (py - smoothed_cy)
-                                    ry = smoothed_cy + sin_t * (px - smoothed_cx) + cos_t * (py - smoothed_cy)
-                                    # clamp after rotation
-                                    rx = max(0, min(int(rx), frame_w - 1))
-                                    ry = max(0, min(int(ry), frame_h - 1))
-                                    roted.append((rx, ry))
-                                moved = roted
+                                moved = [
+                                    (smoothed_cx + cos_t * (px - smoothed_cx) - sin_t * (py - smoothed_cy),
+                                    smoothed_cy + sin_t * (px - smoothed_cx) + cos_t * (py - smoothed_cy))
+                                    for (px, py) in moved
+                                ]
 
                             # update reference (optionally smoothed)
                             if rotation_alpha > 0.0:
@@ -468,10 +581,9 @@ def main():
                             else:
                                 grabbed_ref_angle = cur_ang_deg
 
+                    # 3) clamp polygon rigidly (single dx,dy for all vertices)
+                    s.points = clamp_polygon_rigid(moved, frame_w, frame_h)
 
-                    # 3) write back points if we didn’t rotate (or after rotation)
-                    if 'moved' in locals():
-                        s.points = [(int(px), int(py)) for (px, py) in moved]
 
         else:
             # Not interacting: ensure no stale selection/grab carries into EDIT
@@ -480,9 +592,12 @@ def main():
                 grabbed = False
 
 
-        # Draw shapes
+
+        # show latched highlight while grabbing; otherwise show live selection
+        sel_display_idx = last_selected_idx if (grabbed and last_selected_idx != -1) else selected_idx
         for i, s in enumerate(shapes):
-            s.draw(frame, selected=(mode == "INTERACT" and i == selected_idx))
+            s.draw(frame, selected=(mode == "INTERACT" and i == sel_display_idx))
+
 
         # --- EDIT MODE PREVIEW (draw BEFORE text/imshow) ---
         # --- EDIT MODE PREVIEW (draw BEFORE text/imshow) ---
@@ -562,6 +677,11 @@ def main():
         if sleep > 0:
             time.sleep(sleep)
         last = time.perf_counter()
+
+        # end-of-frame bookkeeping
+        pinch_prev = pinch_now
+        prev_selected_idx = selected_idx
+
 
 
         # Show
