@@ -19,25 +19,48 @@ def _angle_ok(ray_d, pt_from_o, cos_min=0.995):  # ≈ 5.7° cone
     return float(d @ v) > cos_min
 
 def _is_valid_H(H, frame_w, frame_h):
-    if H is None or not isinstance(H, np.ndarray) or H.shape != (3, 3):
+    if H is None or not isinstance(H, np.ndarray):
         return False
+    
+    # --- DEBUG: show the estimated translation from H ---
+    debug_tx = 0.0
+    debug_ty = 0.0
+    if H is not None and isinstance(H, np.ndarray) and H.shape == (3, 3):
+        debug_tx = float(H[0, 2])
+        debug_ty = float(H[1, 2])
+
+    # Accept 2x3 affine or 3x3 homography
+    if H.shape not in [(2, 3), (3, 3)]:
+        return False
+
     if not np.all(np.isfinite(H)):
         return False
-    # Expect affine-like homography with bottom row [0,0,1]
-    if np.linalg.norm(H[2, :] - np.array([0.0, 0.0, 1.0], dtype=np.float32)) > 1e-3:
-        return False
+
+    # Promote 2x3 to 3x3 for uniform checks
+    if H.shape == (2, 3):
+        H3 = np.eye(3, dtype=np.float32)
+        H3[:2, :] = H.astype(np.float32)
+        H = H3
+    else:
+        H = H.astype(np.float32)
+
+    # Basic sanity
     if abs(float(H[2, 2])) < 1e-6:
         return False
-    # Translation should be reasonable (guard wild estimates)
+
+    # Translation guard
     tx, ty = float(H[0, 2]), float(H[1, 2])
     if abs(tx) > 0.25 * frame_w or abs(ty) > 0.25 * frame_h:
         return False
-    # Scale/rotation not absurd (avoid near-zero scale / reflection explosions)
+
+    # Reasonable scale/rotation
     a, b, c, d = float(H[0,0]), float(H[0,1]), float(H[1,0]), float(H[1,1])
-    det = a*d - b*c
+    det = a * d - b * c
     if abs(det) < 1e-6 or abs(det) > 10.0:
         return False
+
     return True
+
 
 
 
@@ -49,6 +72,17 @@ def clamp_rect(x, y, w, h, frame_w, frame_h):
     x = max(0, min(int(x), frame_w - int(w)))
     y = max(0, min(int(y), frame_h - int(h)))
     return int(x), int(y), int(w), int(h)
+
+def _affine_apply_pt(T, x, y):
+    """Apply 3x3 (affine-like) homography to a 2D point."""
+    p = np.array([float(x), float(y), 1.0], dtype=np.float32)
+    q = T @ p
+    w = float(q[2]) if abs(q[2]) > 1e-9 else 1.0
+    return float(q[0]/w), float(q[1]/w)
+
+def _affine_apply_pts(T, pts):
+    return [_affine_apply_pt(T, px, py) for (px, py) in pts]
+
 
 def clamp_center_for_rect(cx, cy, w_rect, h_rect, frame_w, frame_h):
     """Clamp a rectangle's center so the rect stays fully inside the frame."""
@@ -156,6 +190,20 @@ def main():
 
     mode = "EDIT"  # or "INTERACT"
     shapes = load_shapes()
+    for s in shapes:
+        if isinstance(s, Rectangle):
+            if not hasattr(s, "world_center"):
+                s.world_center = tuple(map(float, s.center()))
+        else:  # Polygon
+            if not hasattr(s, "world_points"):
+                s.world_points = [(float(px), float(py)) for (px, py) in s.points]
+
+    # --- World persistence state ---
+    persistence_enabled = True      # turn ON to keep shapes stuck to background
+    T_world = np.eye(3, dtype=np.float32)   # reference -> current cumulative transform
+
+
+    
 
     # Interaction / editing state
     polygon_mode = False
@@ -169,8 +217,8 @@ def main():
     grabbed_idx = -1 
     grab_offset = (0, 0)
     grabbed_ref_angle = None
-    persistence_enabled = False  # <- keep OFF to stop any auto-move; toggle with 'O'
-    Last_selected_idx = -1
+   
+    last_selected_idx = -1
 
     grab_start_tip = None      # (x,y) fingertip position when grab begins
     grab_start_center = None   # (cx,cy) shape center when grab begins
@@ -244,6 +292,10 @@ def main():
 
                 if w0c > 5 and h0c > 5:
                     shapes.append(Rectangle(x0c, y0c, w0c, h0c))
+                    s = shapes[-1]
+                    # store world anchors in reference frame (use current screen as reference)
+                    cx, cy = s.center()
+                    s.world_center = (float(cx), float(cy))
                     cooldown = 10
                     
             start_pt = None
@@ -266,12 +318,15 @@ def main():
 
         # Background optical-feature transform (for persistence)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
+        _ = bg_tracker.estimate_transform(gray)
         if mode == "INTERACT" and not grabbed and cooldown == 0 and persistence_enabled:
-            H_cand = bg_tracker.estimate_transform(gray)  # 3x3
-            H = H_cand if _is_valid_H(H_cand, frame_w, frame_h) else np.eye(3, dtype=np.float32)
+            H_cand = bg_tracker.estimate_transform(gray)
+            if H_cand is not None and H_cand.shape == (2, 3):
+                H3 = np.eye(3, dtype=np.float32); H3[:2,:] = H_cand; H_cand = H3
+            H = H_cand if H_cand is not None else np.eye(3, dtype=np.float32)  # <- no _is_valid_H here
         else:
             H = np.eye(3, dtype=np.float32)
+
 
 
 
@@ -331,7 +386,7 @@ def main():
                         # smooth & clamp to keep inside frame
                         if not hasattr(s, "smoothed_center"):
                             s.smoothed_center = (cx, cy)
-                        alpha_move = 0.15
+                        alpha_move = 0.25
                         smx = int((1 - alpha_move) * s.smoothed_center[0] + alpha_move * nx)
                         smy = int((1 - alpha_move) * s.smoothed_center[1] + alpha_move * ny)
 
@@ -644,6 +699,8 @@ def main():
 
 
         # HUD text
+    
+
         draw_text(frame, f"Mode: {mode}", y=30)
         # Status HUD
         y = 60
@@ -654,6 +711,8 @@ def main():
         draw_text(frame, f"Hand:{'YES' if hand_ok else 'NO'}  Pinch:{pinch_txt}  Selected:{sel_txt}  Grabbed:{grab_txt}", y)
         if pinch_dist_px is not None:
             draw_text(frame, f"PinchDist(px): {pinch_dist_px:.1f}", y+30)
+        hud_bottom = y + (60 if pinch_dist_px is not None else 30)
+        draw_text(frame, f"Persistence:{'ON' if persistence_enabled else 'OFF'}", hud_bottom)
 
         # show thumb-index distance and index angle
         if hand:
@@ -696,6 +755,10 @@ def main():
         elif key in [ord('i'), ord('I')]:
             mode = "INTERACT"
             cooldown = 15
+            try:
+                bg_tracker.reset()  # or bg_tracker.set_reference(gray)
+            except AttributeError:
+                pass
         elif key in [ord('s'), ord('S')]:
             save_shapes(shapes)
         elif key in [ord('l'), ord('L')]:
@@ -705,6 +768,16 @@ def main():
             if not polygon_mode and len(poly_pts) >= 3:
                 shapes.append(Polygon(points=list(poly_pts)))
             poly_pts = []
+        elif key in [ord('o'), ord('O')]:
+            persistence_enabled = not persistence_enabled
+            cooldown = 10  # brief pause so we don’t move shapes during re-sync
+            # If your BackgroundTracker has a reset or set_reference method, call it here:
+            try:
+                bg_tracker.reset()  # or: bg_tracker.set_reference(gray)
+            except AttributeError:
+                pass
+
+        
 
     cap.release()
     cv2.destroyAllWindows()
