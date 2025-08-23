@@ -2,12 +2,47 @@ import cv2
 import numpy as np
 import argparse
 import json
+import sys
 from geometry import Rectangle, Polygon
 from hands import HandTracker
 from persistence import BackgroundTracker
+from pathlib import Path  # ✅ cross-platform file paths
+
+
+# --- Cross-platform camera backends ---
+BACKENDS = {
+    "any":        cv2.CAP_ANY,                       # auto
+    "dshow":      getattr(cv2, "CAP_DSHOW", 700),    # Windows
+    "msmf":       getattr(cv2, "CAP_MSMF", 1400),    # Windows
+    "v4l2":       getattr(cv2, "CAP_V4L2", 200),     # Linux
+    "gstreamer":  getattr(cv2, "CAP_GSTREAMER",1800),# Linux (optional)
+    "avfoundation": getattr(cv2, "CAP_AVFOUNDATION",1200),  # macOS
+}
+
+def _default_backend_for_os() -> str:
+    if sys.platform.startswith("win"):   return "dshow"   # try "msmf" if preferred
+    if sys.platform.startswith("linux"): return "v4l2"
+    if sys.platform == "darwin":         return "avfoundation"
+    return "any"
+
+def _list_cameras(max_idx=10, backend="any"):
+    be = BACKENDS[backend]
+    found = []
+    for i in range(max_idx):
+        cap = cv2.VideoCapture(i, be)
+        ok = cap.isOpened()
+        cap.release()
+        if ok: found.append(i)
+    return found
 
 
 
+
+
+
+
+
+# ---------- Helpers ----------
 
 def _angle_ok(ray_d, pt_from_o, cos_min=0.995):  # ≈ 5.7° cone
     v = np.array(pt_from_o, dtype=np.float32)
@@ -18,53 +53,6 @@ def _angle_ok(ray_d, pt_from_o, cos_min=0.995):  # ≈ 5.7° cone
     d = d / dn
     return float(d @ v) > cos_min
 
-def _is_valid_H(H, frame_w, frame_h):
-    if H is None or not isinstance(H, np.ndarray):
-        return False
-    
-    # --- DEBUG: show the estimated translation from H ---
-    debug_tx = 0.0
-    debug_ty = 0.0
-    if H is not None and isinstance(H, np.ndarray) and H.shape == (3, 3):
-        debug_tx = float(H[0, 2])
-        debug_ty = float(H[1, 2])
-
-    # Accept 2x3 affine or 3x3 homography
-    if H.shape not in [(2, 3), (3, 3)]:
-        return False
-
-    if not np.all(np.isfinite(H)):
-        return False
-
-    # Promote 2x3 to 3x3 for uniform checks
-    if H.shape == (2, 3):
-        H3 = np.eye(3, dtype=np.float32)
-        H3[:2, :] = H.astype(np.float32)
-        H = H3
-    else:
-        H = H.astype(np.float32)
-
-    # Basic sanity
-    if abs(float(H[2, 2])) < 1e-6:
-        return False
-
-    # Translation guard
-    tx, ty = float(H[0, 2]), float(H[1, 2])
-    if abs(tx) > 0.25 * frame_w or abs(ty) > 0.25 * frame_h:
-        return False
-
-    # Reasonable scale/rotation
-    a, b, c, d = float(H[0,0]), float(H[0,1]), float(H[1,0]), float(H[1,1])
-    det = a * d - b * c
-    if abs(det) < 1e-6 or abs(det) > 10.0:
-        return False
-
-    return True
-
-
-
-
-# ---------- Helpers ----------
 def clamp_rect(x, y, w, h, frame_w, frame_h):
     """Clamp a rectangle's top-left so it stays fully inside the frame."""
     if w < 1 or h < 1:
@@ -127,22 +115,34 @@ def clamp_polygon_rigid(points, frame_w, frame_h):
 
 
 
-# ---------- Argparse / Utils ----------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--width", type=int, default=960)
     ap.add_argument("--height", type=int, default=540)
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--max-fps", type=int, default=60)
+
+    # ✅ new cross-platform options
+    ap.add_argument("--backend", type=str, default=None,
+                    choices=list(BACKENDS.keys()),
+                    help="Camera backend (default: OS-specific)")
+    ap.add_argument("--mjpg", action="store_true",
+                    help="Try MJPG FOURCC for higher FPS (common on Windows)")
+    ap.add_argument("--list-cams", action="store_true",
+                    help="List available camera indices and exit")
     return ap.parse_args()
+
 
 def draw_text(frame, text, y=30):
     cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
     cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1, cv2.LINE_AA)
 
 def load_shapes(path="shapes.json"):
+    path = Path(path)  # ✅ portable
+    if not path.exists():
+        return []
     try:
-        with open(path, "r") as f:
+        with path.open("r") as f:
             data = json.load(f)
         shapes = []
         for item in data:
@@ -154,14 +154,16 @@ def load_shapes(path="shapes.json"):
     except Exception:
         return []
 
+
 def save_shapes(shapes, path="shapes.json"):
+    path = Path(path)  # ✅ portable
     data = []
     for s in shapes:
         if isinstance(s, Rectangle):
             data.append({"type":"rect","data":{"x":int(s.x),"y":int(s.y),"w":int(s.w),"h":int(s.h),"angle":float(s.angle)}})
         elif isinstance(s, Polygon):
             data.append({"type":"poly","data":{"points":[(float(px), float(py)) for (px,py) in s.points]}})
-    with open(path, "w") as f:
+    with path.open("w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -171,13 +173,45 @@ def main():
     cooldown = 0  # frames to skip bg tracking after release or shape creation
 
     args = parse_args()
+    # Optional: enumerate cameras and exit
+    if args.list_cams:
+        be = args.backend or _default_backend_for_os()
+        cams = _list_cameras(backend=be)
+        print(f"Backend={be} -> Cameras:", cams)
+        return
+
     import time
     spf = 1.0 / max(1, args.max_fps)
     last = 0.0
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    # Choose backend (CLI > OS default)
+    backend_key = args.backend or _default_backend_for_os()
+    backend_flag = BACKENDS[backend_key]
+
+    # Try chosen backend; if it fails, fall back to CAP_ANY
+    cap = cv2.VideoCapture(args.camera, backend_flag)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(args.camera, cv2.CAP_ANY)
+
+    # Common properties
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS,          args.max_fps)
+
+    # Platform-specific helpful tweaks
+    if sys.platform.startswith("win"):
+        if args.mjpg:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    elif sys.platform.startswith("linux"):
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # lower latency on some V4L2 drivers
+        except Exception:
+            pass
+
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam with any backend.")
+
 
     tracker = HandTracker(
     pinch_on_scale=0.30,     # pinch engages around 0.30 * hand_size
@@ -366,8 +400,6 @@ def main():
             pinch_now = False
 
 
-        # Apply persistence (when not holding anything): move shapes a bit with H, then clamp
-        # only apply background tracking if no shape is being grabbed
         # Apply persistence (background motion) only when appropriate
         if mode == "INTERACT" and not grabbed and cooldown == 0 and persistence_enabled:
 
@@ -419,7 +451,7 @@ def main():
                     x_rect = cx - s.w / 2
                     y_rect = cy - s.h / 2
                     x_rect, y_rect, w_rect, h_rect = clamp_rect(x_rect, y_rect, s.w, s.h, frame_w, frame_h)
-                    # store last smoothed center in the shape
+
                     # compute clamped center
                     clamped_cx = int(x_rect + w_rect / 2)
                     clamped_cy = int(y_rect + h_rect / 2)

@@ -1,18 +1,24 @@
 # 2D AR Pointer & Pinch App (Full)
 
-## Quick start (macOS, Intel)
+## Setup Environment
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate     # (Linux/macOS)
+# .venv\Scripts\activate      # (Windows PowerShell)
+
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
-python main.py --width 960 --height 540 --max-fps 60
-```
+
+
+
 
 If `mediapipe` wheels complain:
 ```bash
 pip install mediapipe
 ```
+## Run App
+python main.py --width 960 --height 540 --max-fps 60
+
 
 ## Controls
 - `E` — Edit mode
@@ -26,7 +32,9 @@ pip install mediapipe
   - **Pinch** (thumb–index) to grab & move
   - Release pinch to drop
   - Hold **R** while grabbing to enable simple wrist-angle rotation (experimental)
-- `Q` or `Esc` — Quit
+- General
+  - `O` — toggle persistence (world-lock shapes)
+  - `Q` or `Esc` — Quit
 
 ## Notes
 - Good lighting improves hand tracking.
